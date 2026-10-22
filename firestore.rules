@@ -1,0 +1,476 @@
+rules_version = '2';
+
+// TaskEarn — Firestore Security Rules.
+//
+// There is no server: these rules ARE the backend's security layer. Every
+// money-moving client write must match one of the exact patterns below.
+// Every rule here is covered by test/rules (Firestore Emulator).
+//
+// Residual risk (documented for the client): rules guarantee real elapsed
+// server time and one completion per task, but they cannot see the screen.
+// Someone could leave a video playing without watching it.
+
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ------------------------------------------------------------ helpers
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function userPath(u) { return /databases/$(db)/documents/users/$(u); }
+    function adminPath(u) { return /databases/$(db)/documents/admins/$(u); }
+    function settingsPath() { return /databases/$(db)/documents/settings/app; }
+    function taskPath(t) { return /databases/$(db)/documents/tasks/$(t); }
+    function sessionPath(s) { return /databases/$(db)/documents/watchSessions/$(s); }
+    function completionPath(u, t) { return /databases/$(db)/documents/users/$(u)/completions/$(t); }
+    function txPath(u, t) { return /databases/$(db)/documents/users/$(u)/transactions/$(t); }
+    function codePath(c) { return /databases/$(db)/documents/referralCodes/$(c); }
+    function proofPath(p) { return /databases/$(db)/documents/paymentProofs/$(p); }
+    function subOrderPath(o) { return /databases/$(db)/documents/subscriptionOrders/$(o); }
+    function promoOrderPath(o) { return /databases/$(db)/documents/promoteOrders/$(o); }
+    function withdrawPath(w) { return /databases/$(db)/documents/withdrawRequests/$(w); }
+    function packagePath(p) { return /databases/$(db)/documents/promotePackages/$(p); }
+
+    function isAdmin() { return signedIn() && exists(adminPath(uid())); }
+    function me() { return get(userPath(uid())).data; }
+    function meAfter() { return getAfter(userPath(uid())).data; }
+    function cfg() { return get(settingsPath()).data; }
+
+    // Subscribed and not blocked.
+    function active() {
+      let m = me();
+      return m.subscriptionActive == true && m.isBlocked == false;
+    }
+
+    function notBlocked() { return me().isBlocked == false; }
+
+    function incoming() { return request.resource.data; }
+
+    function onlyChanges(keys) {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys);
+    }
+
+    function exactKeys(keys) {
+      return request.resource.data.keys().hasOnly(keys)
+          && request.resource.data.keys().hasAll(keys);
+    }
+
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function optStr(v, max) { return v == null || (v is string && v.size() <= max); }
+    function nonNegInt(v) { return v is int && v >= 0; }
+
+    function validTxnId(v) { return v is string && v.matches('^[A-Za-z0-9]{6,40}$'); }
+    function validCode(v) { return v is string && v.matches('^[A-Z0-9]{8}$'); }
+    function validPhone(v) { return v is string && v.matches('^(03[0-9]{9}|[+]923[0-9]{9})$'); }
+    function validVideoId(v) { return v is string && v.matches('^[A-Za-z0-9_-]{11}$'); }
+
+    // Status transition by an admin: only out of 'pending', exactly once.
+    function adminReview(extraKeys) {
+      return isAdmin()
+        && resource.data.status == 'pending'
+        && incoming().status in ['approved', 'rejected']
+        && onlyChanges(['status', 'reviewedAt', 'reviewedBy', 'rejectionReason'].concat(extraKeys));
+    }
+
+    // ------------------------------------------------------------ admins
+    // Admin role = a doc at admins/{uid}, created ONLY in the Firebase console.
+    match /admins/{id} {
+      allow get: if signedIn() && id == uid();
+      allow list: if false;
+      allow write: if false;
+    }
+
+    // ------------------------------------------------------------ referral codes
+    // Create-only => code uniqueness. A user can create exactly one code: the one
+    // written into their own user doc in the same signup batch.
+    match /referralCodes/{code} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if signedIn()
+        && validCode(code)
+        && exactKeys(['uid'])
+        && incoming().uid == uid()
+        && !exists(userPath(uid()))
+        && meAfter().referralCode == code;
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------ users
+    match /users/{u} {
+      allow get, list: if signedIn() && (u == uid() || isAdmin());
+
+      allow create: if signedIn() && u == uid() && validNewUser();
+
+      allow update: if signedIn() && (
+           (u == uid() && validProfileEdit())
+        || (u == uid() && validTaskCredit())
+        || (u == uid() && validWithdrawHold())
+        || (u == uid() && validPendingSubFlag())
+        || isAdmin()
+      );
+
+      allow delete: if false;
+
+      function validNewUser() {
+        let d = incoming();
+        let referred = d.referredBy != null;
+        return exactKeys([
+            'name', 'nameLower', 'email', 'phone', 'photoUrl', 'isBlocked',
+            'subscriptionActive', 'subscriptionActivatedAt', 'hasPendingSubscription',
+            'balance', 'totalEarned', 'totalReferralEarned', 'totalWithdrawn',
+            'pendingWithdraw', 'completedTasksCount', 'referralCode', 'referredBy',
+            'referredByCode', 'referralBonusPaid', 'referralCount', 'lastWithdrawAt',
+            'lastWithdrawRequestId', 'lastCompletionTaskId', 'createdAt'])
+          && str(d.name, 3, 100)
+          && d.nameLower == d.name.lower()
+          && d.email == request.auth.token.email
+          && validPhone(d.phone)
+          && d.photoUrl == null
+          && d.isBlocked == false
+          && d.subscriptionActive == false
+          && d.subscriptionActivatedAt == null
+          && d.hasPendingSubscription == false
+          && d.balance == 0
+          && d.totalEarned == 0
+          && d.totalReferralEarned == 0
+          && d.totalWithdrawn == 0
+          && d.pendingWithdraw == 0
+          && d.completedTasksCount == 0
+          && d.referralBonusPaid == false
+          && d.referralCount == 0
+          && d.lastWithdrawAt == null
+          && d.lastWithdrawRequestId == null
+          && d.lastCompletionTaskId == null
+          && d.createdAt == request.time
+          && validCode(d.referralCode)
+          && getAfter(codePath(d.referralCode)).data.uid == u
+          && (
+            (!referred && d.referredByCode == null)
+            || (referred
+                && d.referredBy is string
+                && d.referredBy != u
+                && validCode(d.referredByCode)
+                && get(codePath(d.referredByCode)).data.uid == d.referredBy)
+          );
+      }
+
+      function validProfileEdit() {
+        let d = incoming();
+        return onlyChanges(['name', 'nameLower', 'phone', 'photoUrl'])
+          && resource.data.isBlocked == false
+          && str(d.name, 3, 100)
+          && d.nameLower == d.name.lower()
+          && validPhone(d.phone)
+          && optStr(d.photoUrl, 500);
+      }
+
+      // Balance may only grow by exactly videoReward, and only in the same
+      // write that creates a NEW completion doc (whose own rule checks the
+      // watch session, subscription, task and timing).
+      function validTaskCredit() {
+        let d = incoming();
+        let o = resource.data;
+        let tid = d.lastCompletionTaskId;
+        let reward = cfg().videoReward;
+        return onlyChanges(['balance', 'totalEarned', 'completedTasksCount', 'lastCompletionTaskId'])
+          && tid is string
+          && !exists(completionPath(u, tid))
+          && existsAfter(completionPath(u, tid))
+          && d.balance == o.balance + reward
+          && d.totalEarned == o.totalEarned + reward
+          && d.completedTasksCount == o.completedTasksCount + 1;
+      }
+
+      // Balance may only drop by the exact amount of a NEW withdraw request
+      // created in the same write.
+      function validWithdrawHold() {
+        let d = incoming();
+        let o = resource.data;
+        let rid = d.lastWithdrawRequestId;
+        let amount = getAfter(withdrawPath(rid)).data.amount;
+        return onlyChanges(['balance', 'pendingWithdraw', 'lastWithdrawAt', 'lastWithdrawRequestId'])
+          && rid is string
+          && !exists(withdrawPath(rid))
+          && existsAfter(withdrawPath(rid))
+          && d.balance == o.balance - amount
+          && d.pendingWithdraw == o.pendingWithdraw + amount
+          && d.lastWithdrawAt == request.time;
+      }
+
+      // false -> true only (the order's own rule demands this flip in the same
+      // write). Only admin can clear it again (approve/reject).
+      function validPendingSubFlag() {
+        return onlyChanges(['hasPendingSubscription'])
+          && resource.data.hasPendingSubscription == false
+          && incoming().hasPendingSubscription == true
+          && resource.data.subscriptionActive == false
+          && resource.data.isBlocked == false;
+      }
+
+      // ---------------------------------------------------------- completions
+      // Doc id = taskId => one completion per user per task, enforced by the DB.
+      match /completions/{tid} {
+        allow get, list: if signedIn() && (u == uid() || isAdmin());
+        allow create: if signedIn() && u == uid() && validCompletion(tid);
+        allow update, delete: if false;
+      }
+
+      function validCompletion(tid) {
+        let t = get(taskPath(tid)).data;
+        let s = get(sessionPath(uid() + '_' + tid)).data;
+        let c = cfg();
+        let durMs = t.durationSeconds * 1000;
+        let elapsed = request.time.toMillis() - s.startedAt.toMillis();
+        let d = incoming();
+        return exactKeys(['taskId', 'reward', 'completedAt'])
+          && d.taskId == tid
+          && d.reward == c.videoReward
+          && d.completedAt == request.time
+          && active()
+          && t.isActive == true
+          && t.expiresAt > request.time
+          && t.durationSeconds is int && t.durationSeconds > 0
+          && t.get('ownerUid', null) != uid()
+          && s.uid == uid() && s.taskId == tid && s.status == 'started'
+          && elapsed * 100 >= durMs * c.minWatchPercent
+          && elapsed <= durMs * 3
+          && meAfter().lastCompletionTaskId == tid
+          && existsAfter(txPath(uid(), 'task_' + tid));
+      }
+
+      // ---------------------------------------------------------- ledger
+      match /transactions/{tx} {
+        allow get, list: if signedIn() && (u == uid() || isAdmin());
+        // A user may only create the ledger row tied to their own credit/hold
+        // in the same write. Everything else is admin-only.
+        allow create: if signedIn() && (
+             (u == uid() && tx.matches('^task_.+$') && validTaskLedger(tx.split('_')[1]))
+          || (u == uid() && tx.matches('^wd_.+$') && validWithdrawLedger(tx.split('_')[1]))
+          || isAdmin()
+        );
+        allow update, delete: if false;
+      }
+
+      function ledgerShape(type, refId) {
+        let d = incoming();
+        return exactKeys(['type', 'amount', 'balanceAfter', 'refId', 'title', 'createdAt'])
+          && d.type == type
+          && d.refId == refId
+          && str(d.title, 1, 100)
+          && d.createdAt == request.time
+          && d.balanceAfter == meAfter().balance;
+      }
+
+      function validTaskLedger(tid) {
+        return ledgerShape('task_reward', tid)
+          && !exists(completionPath(uid(), tid))
+          && existsAfter(completionPath(uid(), tid))
+          && incoming().amount == cfg().videoReward;
+      }
+
+      function validWithdrawLedger(rid) {
+        let r = getAfter(withdrawPath(rid)).data;
+        return ledgerShape('withdraw_hold', rid)
+          && !exists(withdrawPath(rid))
+          && r.uid == uid()
+          && incoming().amount == -r.amount;
+      }
+    }
+
+    // ------------------------------------------------------------ watch sessions
+    // Deterministic id {uid}_{taskId}. startedAt must be the server time of the
+    // write, so a session can never be back-dated.
+    match /watchSessions/{sid} {
+      allow get: if signedIn() && (isAdmin() || resource.data.uid == uid());
+      allow list: if isAdmin();
+
+      allow create: if signedIn()
+        && exactKeys(['uid', 'taskId', 'status', 'startedAt'])
+        && incoming().uid == uid()
+        && incoming().taskId is string
+        && sid == uid() + '_' + incoming().taskId
+        && incoming().status == 'started'
+        && incoming().startedAt == request.time
+        && active();
+
+      allow update: if signedIn()
+        && resource.data.uid == uid()
+        && resource.data.status == 'started'
+        && (
+          // Restart: only the start time moves, to "now".
+          (onlyChanges(['startedAt'])
+            && incoming().startedAt == request.time
+            && active())
+          // Complete: only together with the new completion doc.
+          || (onlyChanges(['status', 'completedAt', 'reportedWatchedSeconds'])
+            && incoming().status == 'completed'
+            && incoming().completedAt == request.time
+            && nonNegInt(incoming().reportedWatchedSeconds)
+            && !exists(completionPath(uid(), resource.data.taskId))
+            && existsAfter(completionPath(uid(), resource.data.taskId)))
+        );
+
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ referrals
+    match /referrals/{referrer}/referred/{referee} {
+      allow get, list: if signedIn() && (referrer == uid() || isAdmin());
+      // Only in the signup batch, and only for the referrer named in the new
+      // (immutable) user doc.
+      allow create: if signedIn()
+        && referee == uid()
+        && referrer != uid()
+        && !exists(userPath(uid()))
+        && meAfter().referredBy == referrer
+        && exactKeys(['refereeName', 'status', 'bonus', 'createdAt'])
+        && str(incoming().refereeName, 1, 100)
+        && incoming().status == 'pending'
+        && incoming().bonus == 0
+        && incoming().createdAt == request.time;
+      allow update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // ------------------------------------------------------------ public content
+    match /tasks/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /promotePackages/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /faqs/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /settings/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ------------------------------------------------------------ payment proofs
+    // Proof id == order id, so a proof can only be created together with a
+    // brand-new order of the same user (no free-floating uploads).
+    match /paymentProofs/{id} {
+      allow get: if signedIn() && (isAdmin() || resource.data.uid == uid());
+      allow list: if false;
+      allow create: if signedIn()
+        && exactKeys(['uid', 'bytes', 'mimeType', 'sizeBytes', 'createdAt'])
+        && incoming().uid == uid()
+        && incoming().bytes is bytes
+        && incoming().bytes.size() < 600000
+        && incoming().sizeBytes == incoming().bytes.size()
+        && incoming().mimeType == 'image/jpeg'
+        && incoming().createdAt == request.time
+        && (
+          (!exists(subOrderPath(id)) && getAfter(subOrderPath(id)).data.uid == uid())
+          || (!exists(promoOrderPath(id)) && getAfter(promoOrderPath(id)).data.uid == uid())
+        );
+      allow update, delete: if false;
+    }
+
+    // ------------------------------------------------------------ subscription orders
+    match /subscriptionOrders/{id} {
+      allow get, list: if signedIn() && (isAdmin() || resource.data.uid == uid());
+
+      allow create: if signedIn() && validSubscriptionOrder(id);
+
+      allow update: if adminReview([]);
+      allow delete: if false;
+
+      function validSubscriptionOrder(id) {
+        let d = incoming();
+        let m = me();
+        let price = cfg().subscriptionPrice;
+        return exactKeys(['uid', 'userName', 'userEmail', 'amount', 'priceAtSubmission',
+                          'transactionId', 'proofId', 'status', 'createdAt'])
+          && d.uid == uid()
+          && str(d.userName, 1, 100)
+          && str(d.userEmail, 3, 200)
+          && d.status == 'pending'
+          && d.amount == price
+          && d.priceAtSubmission == price
+          && validTxnId(d.transactionId)
+          && d.proofId == id
+          && d.createdAt == request.time
+          && m.subscriptionActive == false
+          && m.hasPendingSubscription == false
+          && m.isBlocked == false
+          && meAfter().hasPendingSubscription == true
+          && getAfter(proofPath(id)).data.uid == uid();
+      }
+    }
+
+    // ------------------------------------------------------------ promote orders
+    match /promoteOrders/{id} {
+      allow get, list: if signedIn() && (isAdmin() || resource.data.uid == uid());
+
+      allow create: if signedIn() && validPromoteOrder(id);
+
+      allow update: if adminReview(['taskId', 'startAt', 'expiresAt']);
+      allow delete: if false;
+
+      function validPromoteOrder(id) {
+        let d = incoming();
+        let pkg = get(packagePath(d.packageId)).data;
+        return exactKeys(['uid', 'userName', 'videoUrl', 'youtubeVideoId', 'videoTitle',
+                          'videoDescription', 'packageId', 'packageName', 'price',
+                          'durationDays', 'transactionId', 'proofId', 'status', 'createdAt'])
+          && d.uid == uid()
+          && str(d.userName, 1, 100)
+          && str(d.videoUrl, 10, 300)
+          && validVideoId(d.youtubeVideoId)
+          && str(d.videoTitle, 1, 100)
+          && str(d.videoDescription, 0, 500)
+          && d.packageId is string
+          && pkg.isActive == true
+          && d.packageName == pkg.name
+          && d.price == pkg.price
+          && d.durationDays == pkg.durationDays
+          && validTxnId(d.transactionId)
+          && d.proofId == id
+          && d.status == 'pending'
+          && d.createdAt == request.time
+          && notBlocked()
+          && getAfter(proofPath(id)).data.uid == uid();
+      }
+    }
+
+    // ------------------------------------------------------------ withdraw requests
+    match /withdrawRequests/{id} {
+      allow get, list: if signedIn() && (isAdmin() || resource.data.uid == uid());
+
+      allow create: if signedIn() && validWithdrawRequest(id);
+
+      allow update: if adminReview(['adminTransferRef']);
+      allow delete: if false;
+
+      function validWithdrawRequest(id) {
+        let d = incoming();
+        let m = me();
+        let c = cfg();
+        return exactKeys(['uid', 'userName', 'amount', 'accountHolderName', 'bankName',
+                          'accountNumber', 'status', 'prevLastWithdrawAt', 'createdAt'])
+          && d.uid == uid()
+          && str(d.userName, 1, 100)
+          && str(d.accountHolderName, 3, 100)
+          && str(d.bankName, 2, 100)
+          && d.accountNumber is string
+          && d.accountNumber.matches('^([0-9]{8,24}|PK[A-Z0-9]{22})$')
+          && d.status == 'pending'
+          && d.amount is int
+          && d.amount >= c.minWithdraw
+          && d.amount <= m.balance
+          && m.subscriptionActive == true
+          && m.isBlocked == false
+          && d.prevLastWithdrawAt == m.lastWithdrawAt
+          && (m.lastWithdrawAt == null
+              || request.time - m.lastWithdrawAt >= duration.value(c.withdrawCooldownDays, 'd'))
+          && d.createdAt == request.time
+          && meAfter().lastWithdrawRequestId == id;
+      }
+    }
+  }
+}

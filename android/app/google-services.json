@@ -1,0 +1,30 @@
+{
+  "project_info": {
+    "project_number": "347026666236",
+    "firebase_url": "https://usa-project-3fd51-default-rtdb.firebaseio.com",
+    "project_id": "usa-project-3fd51",
+    "storage_bucket": "usa-project-3fd51.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:347026666236:android:93b0961f17c7fe0fca9d79",
+        "android_client_info": {
+          "package_name": "com.video.earn.app.tasks"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCcQSoq_ysu87zJUaE2HeT3s50rsqTVl4M"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
